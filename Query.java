@@ -116,7 +116,7 @@ public class Query extends QueryAbstract {
     this.getIndirectFlights = conn.prepareStatement(getIndirectFlightsString);
 
     // Statement for getting a reservation based on a specific day.
-    String getReservationsForDayString = "SELECT * FROM Reservations_lizazak AS r JOIN Flights AS f ON r.flight1_id = f.fid WHERE f.day_of_month = ?";
+    String getReservationsForDayString = "SELECT * FROM Reservations_lizazak AS r JOIN Flights AS f ON r.flight1_id = f.fid WHERE f.day_of_month = ? AND r.username = ?";
     this.getReservationsForDay = conn.prepareStatement(getReservationsForDayString);
 
     // Statement for inserting a booking a new itinerary
@@ -395,8 +395,12 @@ public class Query extends QueryAbstract {
       return "Cannot book reservations, not logged in\n";
     }
 
+    if (this.lastSearchedItineraries == null) {
+      return "No such itinerary " + itineraryId + "\n";
+    }
+
     Itinerary currentItinerary = getItinerary(itineraryId);
-    if (this.lastSearchedItineraries == null || currentItinerary == null) {
+    if (currentItinerary == null) {
       // If a previous search was not performed or there is no itinerary with
       // the specified id, cannot make a reservation.
       return "No such itinerary " + itineraryId + "\n";
@@ -405,24 +409,32 @@ public class Query extends QueryAbstract {
     Flight flight1 = currentItinerary.flight1;
     Flight flight2 = currentItinerary.flight2;
 
+    ResultSet existingBookings = null;
+    ResultSet seatsTaken1 = null;
+    ResultSet seatsTaken2 = null;
+
     try {
-      // Check if a booking for the same day already exists
+      // Start a transaction.
+      this.conn.setAutoCommit(false);
+
+      // Check if a booking for the same day already exists for this user.
       this.getReservationsForDay.clearParameters();
       this.getReservationsForDay.setInt(1, flight1.dayOfMonth);
-      ResultSet existingBookings = this.getReservationsForDay.executeQuery();
-      // If the username already exists, return an error
+      this.getReservationsForDay.setString(2, this.currentUser);
+      existingBookings = this.getReservationsForDay.executeQuery();
       if (existingBookings.next()) {
-        existingBookings.close();
+        this.conn.rollback();
         return "You cannot book two flights in the same day\n";
       }
 
       // If the first flight on this reservation is at capacity, return an error.
       this.getSeatsTakenFlight1.clearParameters();
       this.getSeatsTakenFlight1.setInt(1, flight1.fid);
-      ResultSet seatsTaken1 = this.getSeatsTakenFlight1.executeQuery();
+      seatsTaken1 = this.getSeatsTakenFlight1.executeQuery();
       if (seatsTaken1.next()) {
         int currentCap1 = seatsTaken1.getInt("count");
         if (checkFlightCapacity(flight1.fid) <= currentCap1) {
+          this.conn.rollback();
           return "Booking failed\n";
         }
       }
@@ -431,10 +443,11 @@ public class Query extends QueryAbstract {
       if (flight2 != null) {
         this.getSeatsTakenFlight2.clearParameters();
         this.getSeatsTakenFlight2.setInt(1, flight2.fid);
-        ResultSet seatsTaken2 = this.getSeatsTakenFlight2.executeQuery();
+        seatsTaken2 = this.getSeatsTakenFlight2.executeQuery();
         if (seatsTaken2.next()) {
           int currentCap2 = seatsTaken2.getInt("count");
           if (checkFlightCapacity(flight2.fid) <= currentCap2) {
+            this.conn.rollback();
             return "Booking failed\n";
           }
         }
@@ -463,9 +476,41 @@ public class Query extends QueryAbstract {
       // Execute the add update.
       this.addReserveration.executeUpdate();
 
+      // Commit the transaction
+      this.conn.commit();
+
       return "Booked flight(s), reservation ID: " + newResId + "\n";
     } catch(SQLException e) {
+      // Undo any changes that may have been made.
+      try {
+        this.conn.rollback();
+      } catch (SQLException b) {}
+
+      // Check and retry if there is a deadlock.
+      if (isDeadlock(e)) {
+        return this.transaction_book(itineraryId);
+      }
       e.printStackTrace();
+    } finally {
+      if (existingBookings != null) {
+        try {
+          existingBookings.close();
+        } catch (SQLException e) {}
+      }
+      if (seatsTaken1 != null) {
+        try {
+          seatsTaken1.close();
+        } catch (SQLException e) {}
+      }
+      if (seatsTaken2 != null) {
+        try {
+          seatsTaken2.close();
+        } catch (SQLException e) {}
+      }
+      // Set autocommit to true so future transactions are auto-committed.
+      try {
+        this.conn.setAutoCommit(true);
+      } catch (SQLException e) {}
     }
     return "Booking failed\n";
   }
@@ -593,14 +638,22 @@ public class Query extends QueryAbstract {
   }
 
   private int getNextResID() {
+    ResultSet nextID = null;
+
     try {
       this.getNextResID.clearParameters();
-      ResultSet nextID = this.getNextResID.executeQuery();
+      nextID = this.getNextResID.executeQuery();
       if (nextID.next()) {
         return nextID.getInt("count") + 1;
       }
     } catch (SQLException e) {
-      e.printStackTrace();;
+      e.printStackTrace();
+    } finally {
+      if (nextID != null) {
+        try {
+          nextID.close();
+        } catch (SQLException e) {}
+      }
     }
     return 1;
   }
