@@ -214,16 +214,17 @@ public class Query extends QueryAbstract {
     // Usernames are case-insensitive, so convert input to lowercase.
     username = username.toLowerCase();
 
+    ResultSet existingUsers = null;
+
     try {
       // Start a transaction
       this.conn.setAutoCommit(false);
 
       this.getUserIfExists.clearParameters();
       this.getUserIfExists.setString(1, username);
-      ResultSet existingUsers = this.getUserIfExists.executeQuery();
+      existingUsers = this.getUserIfExists.executeQuery();
       // If the username already exists, return an error
       if (existingUsers.next()) {
-        existingUsers.close();
         this.conn.rollback();
         return "Failed to create user\n";
       }
@@ -245,12 +246,21 @@ public class Query extends QueryAbstract {
       this.createUser.executeUpdate();
 
       // Commit this as a single transaction.
-
       this.conn.commit();
+
       return "Created user " + username + "\n";
     } catch(SQLException e) {
+      if (isDeadlock(e)) {
+        // return this.transaction_createCustomer(username, password, initAmount);
+        return this.transaction_createCustomer(username, password, initAmount);
+      }
       e.printStackTrace();
     } finally {
+      if (existingUsers != null) {
+        try {
+          existingUsers.close();
+        } catch (SQLException e) {}
+      }
       try {
         this.conn.setAutoCommit(true);
       } catch (SQLException e) {}
